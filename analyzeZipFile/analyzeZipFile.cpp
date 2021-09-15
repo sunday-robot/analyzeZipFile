@@ -1,13 +1,6 @@
 ﻿#include <stdio.h>
 #include <string.h>
 
-const unsigned long localFileHeaderSignature = 0x04034b50;
-const unsigned long dataDescriptorSignature = 0x08074b50;
-const unsigned long centralDirectoryHeaderSignature = 0x02014b50;
-const unsigned long zip64EndOfCentralDirectoryRecordSignature = 0x06064b50;
-const unsigned long zip64EndOfCentralDirectoryLocatorSignature = 0x07064b50;
-const unsigned long endOfCentralDirectoryHeaderSignature = 0x06054b50;
-
 void printSectionKey(const char *section, const char *key) {
 	char buf[1000];
 	sprintf_s(buf, "%s.%s", section, key);
@@ -71,14 +64,11 @@ void printWord(unsigned short value) {
 	printf("0x%04x\n", value);
 }
 
-void printDWord(unsigned long value) {
-	printf("0x%08x", value);
-}
-
-void printDWord(const char *key, FILE *fp) {
+unsigned long printDWord(const char *key, FILE *fp) {
 	auto value = readDWord(fp);
 	printKey(key);
 	printf("0x%08x\n", value);
+	return value;
 }
 
 void printDWord(const char *key, unsigned long value) {
@@ -86,15 +76,11 @@ void printDWord(const char *key, unsigned long value) {
 	printf("0x%08x\n", value);
 }
 
-void printQWord(const char *key, FILE *fp) {
+unsigned long long printQWord(const char *key, FILE *fp) {
 	printKey(key);
 	auto value = readQWord(fp);
 	printf("0x%016llx\n", value);
-}
-
-void printOffset(FILE * fp) {
-	auto offset = _ftelli64(fp);
-	printf("%016llx\n", offset);
+	return value;
 }
 
 void printByte(const char *key, FILE *fp, int size) {
@@ -142,33 +128,45 @@ long long printLongLong(const char *key, FILE *fp) {
 	return value;
 }
 
-void printZip64ExtraField(const unsigned char *data, int dataSize, long long *compressedSize)
+void printZip64ExtraField(const unsigned char *data, int dataSize,
+	bool originalSizeRequired, bool compressedSizeRequired, bool offsetOflocalFileHeaderRequired,
+	long long *compressedSize, unsigned long long *offsetOfLocalFileHeader)
 {
-	if (dataSize >= 8) {
-		auto value = *((long long *)data);
+	int index = 0;
+	if (originalSizeRequired) {
+		auto value = *((long long *)(data + index));
 		printKey("      original size");
 		printf("%lld\n", value);
+		index += 8;
+		if (index >= dataSize)
+			return;
 	}
 
-	if (dataSize >= 8 + 8) {
-		auto value = *((long long *)(data + 8));
+	if (compressedSizeRequired) {
+		auto value = *((long long *)(data + index));
 		printKey("      compressed size");
 		printf("%lld\n", value);
 		if (compressedSize != 0)
 			*compressedSize = value;
+		index += 8;
+		if (index >= dataSize)
+			return;
 	}
 
-	if (dataSize >= 8 + 8 + 8) {
-		auto value = *((unsigned long long *)(data + 8 + 8));
+	if (offsetOflocalFileHeaderRequired) {
+		auto value = *((unsigned long long *)(data + index));
 		printKey("      relative header offset");
 		printf("0x%016llx\n", value);
+		if (offsetOfLocalFileHeader != 0)
+			*offsetOfLocalFileHeader = value;
+		index += 8;
+		if (index >= dataSize)
+			return;
 	}
 
-	if (dataSize >= 8 + 8 + 8 + 4) {
-		auto value = *((long *)(data + 8 + 8 + 8));
-		printKey("      disk start number");
-		printf("%d\n", value);
-	}
+	auto value = *((long *)(data + index));
+	printKey("      disk start number");
+	printf("%d\n", value);
 }
 
 void printNtfsTime(const unsigned char *data)
@@ -201,7 +199,9 @@ void printNtfsExtraField(const unsigned char *data, int dataSize) {
 	}
 }
 
-void printExtraField(FILE *fp, int size, long long *compressedSize) {
+void analyzeExtraField(FILE *fp, int size,
+	bool originalSizeRequired, bool compressedSizeRequired, bool offsetOflocalFileHeaderRequired,
+	long long *compressedSize, unsigned long long *offsetOfLocalFileHeader) {
 	printKey("extra field");
 	if (size == 0) {
 		printf("(empty)\n");
@@ -223,7 +223,7 @@ void printExtraField(FILE *fp, int size, long long *compressedSize) {
 			switch (headerId) {
 			case 0x0001:
 				printf("      data\n");
-				printZip64ExtraField(p, dataSize, compressedSize);
+				printZip64ExtraField(p, dataSize, originalSizeRequired, compressedSizeRequired, offsetOflocalFileHeaderRequired, compressedSize, offsetOfLocalFileHeader);
 				break;
 			case 0x000a:
 				printf("      data\n");
@@ -243,37 +243,37 @@ void printExtraField(FILE *fp, int size, long long *compressedSize) {
 	}
 }
 
-void printOffsetAndSignature(FILE *fp, const char *section, unsigned long signature) {
-	auto offset = _ftelli64(fp) - 4/*4=signature size*/;
-	printf("%016llx: %s\n", offset, section);
+void printOffsetAndSignature(FILE *fp, const char *section, int fileIndex = -1) {
+	auto offset = _ftelli64(fp);
+	auto signature = readDWord(fp);
+	printf("%016llx: %s", offset, section);
+	if (fileIndex >= 0)
+		printf("[%d]", fileIndex);
+	printf("\n");
 	printDWord("signature", signature);
 }
 
-void printOffsetAndSignature(FILE *fp, const char *section, int fileIndex, unsigned long signature) {
-	auto offset = _ftelli64(fp) - 4/*4=signature size*/;
-	printf("%016llx: %s[%d]\n", offset, section, fileIndex);
-	printDWord("signature", signature);
-}
-
-void analyzeLocalFileHeader(FILE *fp, int fileIndex, short *version, long long *compressedSize) {
-	printOffsetAndSignature(fp, "local file header", fileIndex, localFileHeaderSignature);
-	*version = printShort("version needed to extract", fp);
-	printWord("general purpose bit flag", fp);
+void analyzeLocalFileHeader(FILE *fp, int fileIndex, unsigned short *generalPurposeFlag) {
+	printOffsetAndSignature(fp, "local file header", fileIndex);
+	printShort("version needed to extract", fp);
+	*generalPurposeFlag = printWord("general purpose bit flag", fp);
 	printShort("compression method", fp);
 	printByte("last mod file time", fp, 2);
 	printByte("last mod file date", fp, 2);
 	printDWord("crc-32", fp);
-	*compressedSize = printLong("compressed size", fp);
-	printLong("uncompressed size", fp);
+	auto compressedSize = printLong("compressed size", fp);
+	auto uncompressedSize = printLong("uncompressed size", fp);
 	auto fileNameLength = printShort("file name length", fp);
 	auto extraFieldLength = printShort("extra field length", fp);
 	printString("file name", fp, fileNameLength);
-	printExtraField(fp, extraFieldLength, compressedSize);
+	analyzeExtraField(fp, extraFieldLength, compressedSize == -1, uncompressedSize == -1, false, 0, 0);
 	printf("\n");
 }
 
 void analyzeDataDescriptor(short version, FILE *fp, int fileIndex) {
-	printOffsetAndSignature(fp, "data descriptor", fileIndex, dataDescriptorSignature);
+	auto offset = _ftelli64(fp);
+	printf("%016llx: data descriptor[%d]\n", offset, fileIndex);
+
 	printDWord("crc-32", fp);
 	if (version == 45) {
 		printLongLong("compressed size", fp);
@@ -286,45 +286,51 @@ void analyzeDataDescriptor(short version, FILE *fp, int fileIndex) {
 	printf("\n");
 }
 
-void analyzeCentralDirectoryHeader(FILE *fp, int fileIndex) {
-	printOffsetAndSignature(fp, "central directory header", fileIndex, centralDirectoryHeaderSignature);
+long long analyzeCentralDirectoryHeader(FILE *fp, int fileIndex, short *version, long long *compressedSize, unsigned long long *offsetOfLocalFileHeader) {
+	auto start = _ftelli64(fp);
+
+	printOffsetAndSignature(fp, "central directory header", fileIndex);
 	printShort("version made by", fp);
-	printShort("version needed to extract", fp);
+	*version = printShort("version needed to extract", fp);
 	printWord("general purpose bit flag", fp);
 	printShort("compression method", fp);
 	printByte("last mod file time", fp, 2);
 	printByte("last mod file date", fp, 2);
 	printDWord("crc-32", fp);
-	printLong("compressed size", fp);
-	printLong("uncompressed size", fp);
+	*compressedSize = printLong("compressed size", fp);
+	auto uncompressedSize = printLong("uncompressed size", fp);
 	auto fileNameLength = printShort("file name length", fp);
 	auto extraFieldLength = printShort("extra field length", fp);
 	auto fileCommentLength = printShort("file comment length", fp);
 	printShort("disk number start", fp);
 	printShort("internal file attribures", fp);
 	printLong("extranal file attributes", fp);
-	printLong("relative offset of local header", fp);
+	*offsetOfLocalFileHeader = printDWord("relative offset of local header", fp);
 	printString("file name", fp, fileNameLength);
-	printExtraField(fp, extraFieldLength, 0);
+	analyzeExtraField(fp, extraFieldLength,
+		uncompressedSize == -1, *compressedSize == -1, *offsetOfLocalFileHeader == 0xffffffff,
+		compressedSize, offsetOfLocalFileHeader);
 	printString("file comment", fp, fileCommentLength);
 	printf("\n");
+
+	return _ftelli64(fp) - start;
 }
 
-void analyzeEndOfCentralDirectoryHeader(FILE *fp) {
-	printOffsetAndSignature(fp, "end of central directory record", endOfCentralDirectoryHeaderSignature);
+void analyzeEndOfCentralDirectoryRecord(FILE *fp, long long *sizeOfTheCentralDirectory, unsigned long long *offsetOfStartOfCentralDirectory) {
+	printOffsetAndSignature(fp, "end of central directory record");
 	printShort("number of this disk", fp);
 	printShort("number of the disk with the start of the central directory", fp);
 	printShort("total number of entries in the central directory on this disk", fp);
 	printShort("total number of entries in the central directory", fp);
-	printLong("size of the central directory", fp);
-	printLong("offset of start of central directory with respect to the starting disk number", fp);
+	*sizeOfTheCentralDirectory = printLong("size of the central directory", fp);
+	*offsetOfStartOfCentralDirectory = printDWord("offset of start of central directory with respect to the starting disk number", fp);
 	auto zipFileCommentLength = printShort(".ZIP file comment length", fp);
 	printString(".ZIP file comment", fp, zipFileCommentLength);
 	printf("\n");
 }
 
-void analyzeZip64EndOfCentralDirectoryRecord(FILE *fp) {
-	printOffsetAndSignature(fp, "Zip64 end of central directory record", zip64EndOfCentralDirectoryRecordSignature);
+void analyzeZip64EndOfCentralDirectoryRecord(FILE *fp, long long *sizeOfTheCentralDirectory, unsigned long long *offsetOfStartOfCentralDirectory) {
+	printOffsetAndSignature(fp, "Zip64 end of central directory record");
 	auto size = printLongLong("size of zip64 end of central directory record", fp);
 	printShort("version made by", fp);
 	printShort("version need to extract", fp);
@@ -332,65 +338,70 @@ void analyzeZip64EndOfCentralDirectoryRecord(FILE *fp) {
 	printLong("number of the disk with the start of the central directory", fp);
 	printLongLong("total number of entries in the central directory on this disk", fp);
 	printLongLong("total number of entries in the central directory", fp);
-	printLongLong("size of the central directory", fp);
-	printQWord("offset of start of central directory with respect to the starting disk number", fp);
+	*sizeOfTheCentralDirectory = printLongLong("size of the central directory", fp);
+	*offsetOfStartOfCentralDirectory = printQWord("offset of start of central directory with respect to the starting disk number", fp);
 	auto zedsSize = size - (2 + 2 + 4 + 4 + 8 + 8 + 8 + 8);	// "version make..."から、"offset of start..."のバイト数を差し引くと、"zip64 extensible..."のバイト数が得られる。
 	printByte("zip64 extensible data sector", fp, zedsSize);
+	printf("\n");
 }
 
-void analyzeZip64EndOfCentralDirectoryLocator(FILE *fp) {
-	printOffsetAndSignature(fp, "Zip64 end of central directory locator", zip64EndOfCentralDirectoryLocatorSignature);
+void analyzeZip64EndOfCentralDirectoryLocator(FILE *fp, unsigned long long *offsetOfTheZip64EndOfCentralDirectoryRecord) {
+	printOffsetAndSignature(fp, "Zip64 end of central directory locator");
 	printLong("number of the disk with the start of the zip64 end central directory", fp);
-	printQWord("relative offset of the zip64 end of central directory record", fp);
+	*offsetOfTheZip64EndOfCentralDirectoryRecord = printQWord("relative offset of the zip64 end of central directory record", fp);
 	printLong("total number of disks", fp);
+	printf("\n");
 }
 
 int main(int argc, char *argv[])
 {
 	FILE *fp;
 	fopen_s(&fp, argv[1], "rb");
-	unsigned long signature;
-	signature = readDWord(fp);
-	for (int i = 0; signature == localFileHeaderSignature; i++) {
+
+	// end of central directory recordは22バイト固定ではなく、はZIPコメントの長さで変わるが、本プログラムではZIPコメントはないものと決め打ちしている。
+	long long sizeOfTheCentralDirectory;
+	unsigned long long offsetOfStartOfCentralDirectory;
+	_fseeki64(fp, -22, SEEK_END);
+	analyzeEndOfCentralDirectoryRecord(fp, &sizeOfTheCentralDirectory, &offsetOfStartOfCentralDirectory);
+
+	if (offsetOfStartOfCentralDirectory == 0xffffffff) {
+		// ZIP64形式の場合
+		unsigned long long offsetOfTheZip64EndOfCentralDirectoryRecord;
+		_fseeki64(fp, -42, SEEK_END);
+		analyzeZip64EndOfCentralDirectoryLocator(fp, &offsetOfTheZip64EndOfCentralDirectoryRecord);
+
+		_fseeki64(fp, offsetOfTheZip64EndOfCentralDirectoryRecord, SEEK_SET);
+		analyzeZip64EndOfCentralDirectoryRecord(fp, &sizeOfTheCentralDirectory, &offsetOfStartOfCentralDirectory);
+	}
+
+	for (auto i = 0; sizeOfTheCentralDirectory > 0; i++) {
 		short version;
 		long long compressedSize;
-		analyzeLocalFileHeader(fp, i, &version, &compressedSize);
-		// [analyzeEncriptionHeader]				// 暗号化されていない場合はこのヘッダーは存在せず、今回の調査では暗号化されたZIPは関係ないので無視しても問題ない。
+		unsigned long long offsetOfLocalFileHeader;
+		_fseeki64(fp, offsetOfStartOfCentralDirectory, SEEK_SET);
+		sizeOfTheCentralDirectory -= analyzeCentralDirectoryHeader(fp, i, &version, &compressedSize, &offsetOfLocalFileHeader);
+		offsetOfStartOfCentralDirectory = _ftelli64(fp);
+
+		unsigned short generalPurposeFlag;
+		_fseeki64(fp, offsetOfLocalFileHeader, SEEK_SET);
+		analyzeLocalFileHeader(fp, i, &generalPurposeFlag);
 
 		auto offset = _ftelli64(fp);
-		printf("%016llx: compressed data(%lld byte)\n\n", offset, compressedSize);
-		_fseeki64(fp, compressedSize, SEEK_CUR);	// [file data]は読み飛ばす。
-		signature = readDWord(fp);
+		printf("%016llx: compressed data[%d](%lld byte)\n\n", offset, i, compressedSize);
 
-		if (signature == dataDescriptorSignature)
-		{
+		if ((generalPurposeFlag & (1 << 3)) != 0) {
+			_fseeki64(fp, compressedSize, SEEK_CUR);
 			analyzeDataDescriptor(version, fp, i);
-			signature = readDWord(fp);
 		}
 	}
-	for (int i = 0; signature == centralDirectoryHeaderSignature; i++) {
-		analyzeCentralDirectoryHeader(fp, i);
-		signature = readDWord(fp);
-	}
-
-	if (signature == zip64EndOfCentralDirectoryRecordSignature) {
-		analyzeZip64EndOfCentralDirectoryRecord(fp);
-		signature = readDWord(fp);
-	}
-
-	if (signature == zip64EndOfCentralDirectoryLocatorSignature) {
-		analyzeZip64EndOfCentralDirectoryLocator(fp);
-		signature = readDWord(fp);
-	}
-
-	if (signature == endOfCentralDirectoryHeaderSignature) {
-		analyzeEndOfCentralDirectoryHeader(fp);
+	if (sizeOfTheCentralDirectory != 0) {
+		fprintf(stderr, "NG\n");
 	}
 	else {
-		printf("Error. unexpected signature.");
+		fprintf(stderr, "OK\n");
 	}
 
 	fclose(fp);
-	getchar();
+	(void)getchar();
 	return 0;
 }
