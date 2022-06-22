@@ -341,7 +341,7 @@ int main(int argc, char *argv[])
 	if (offsetOfStartOfCentralDirectory == 0xffffffff) {
 		// ZIP64形式の場合
 		unsigned long long offsetOfTheZip64EndOfCentralDirectoryRecord;
-		_fseeki64(fp, -42, SEEK_END);
+		_fseeki64(fp, -(22 + 20), SEEK_END);
 		analyzeZip64EndOfCentralDirectoryLocator(fp, &offsetOfTheZip64EndOfCentralDirectoryRecord);
 
 		_fseeki64(fp, offsetOfTheZip64EndOfCentralDirectoryRecord, SEEK_SET);
